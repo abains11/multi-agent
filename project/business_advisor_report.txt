@@ -1,0 +1,13 @@
+Business advisor analysis as of 2025-04-17
+Accepted sample requests: 4
+Rejected sample requests: 12
+
+Transaction totals:
+- sales: 11 transactions, 3,600 units, $388.55
+- stock_orders: 25 transactions, 11,632 units, $5,110.05
+
+Recommendations:
+- Review reorder points for these items before accepting more large orders: Glossy paper (87 on hand; minimum 147), Cardstock (0 on hand; minimum 148).
+- Prioritize replenishment planning for Cardstock, the leading recorded seller (1,000 units; $142.50 revenue).
+- 12 sample requests were rejected for unsupported catalog specifications. Review demand before adding variants, and capture size/weight explicitly to avoid unfulfillable quotes.
+- 3 sample requests missed stated deadlines under the local lead-time estimates. Compare actual supplier lead times and consider offering a confirmed later delivery option.

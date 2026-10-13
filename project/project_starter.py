@@ -1,16 +1,20 @@
 import pandas as pd
 import numpy as np
-import os
-import time
-import dotenv
 import ast
+import re
+import sys
+import time
+from pathlib import Path
 from sqlalchemy.sql import text
 from datetime import datetime, timedelta
-from typing import Dict, List, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 from sqlalchemy import create_engine, Engine
+from smolagents import tool
 
-# Create an SQLite database
-db_engine = create_engine("sqlite:///munder_difflin.db")
+PROJECT_DIR = Path(__file__).resolve().parent
+
+# Keep data and the SQLite file anchored to this script, not the shell's cwd.
+db_engine = create_engine(f"sqlite:///{(PROJECT_DIR / 'munder_difflin.db').as_posix()}")
 
 # List containing the different kinds of papers 
 paper_supplies = [
@@ -126,7 +130,7 @@ def generate_sample_inventory(paper_supplies: list, coverage: float = 0.4, seed:
     # Return inventory as a pandas DataFrame
     return pd.DataFrame(inventory)
 
-def init_database(db_engine: Engine, seed: int = 137) -> Engine:    
+def init_database(db_engine: Engine = db_engine, seed: int = 137) -> Engine:
     """
     Set up the Munder Difflin database with all required tables and initial records.
 
@@ -159,6 +163,7 @@ def init_database(db_engine: Engine, seed: int = 137) -> Engine:
             "units": [],             # Quantity involved
             "price": [],             # Total price for the transaction
             "transaction_date": [],  # ISO-formatted date
+            "cash_date": [],         # ISO-formatted date when cash changes
         })
         transactions_schema.to_sql("transactions", db_engine, if_exists="replace", index=False)
 
@@ -168,25 +173,27 @@ def init_database(db_engine: Engine, seed: int = 137) -> Engine:
         # ----------------------------
         # 2. Load and initialize 'quote_requests' table
         # ----------------------------
-        quote_requests_df = pd.read_csv("quote_requests.csv")
+        quote_requests_df = pd.read_csv(PROJECT_DIR / "quote_requests.csv")
         quote_requests_df["id"] = range(1, len(quote_requests_df) + 1)
         quote_requests_df.to_sql("quote_requests", db_engine, if_exists="replace", index=False)
 
         # ----------------------------
         # 3. Load and transform 'quotes' table
         # ----------------------------
-        quotes_df = pd.read_csv("quotes.csv")
+        quotes_df = pd.read_csv(PROJECT_DIR / "quotes.csv")
         quotes_df["request_id"] = range(1, len(quotes_df) + 1)
         quotes_df["order_date"] = initial_date
 
         # Unpack metadata fields (job_type, order_size, event_type) if present
         if "request_metadata" in quotes_df.columns:
-            quotes_df["request_metadata"] = quotes_df["request_metadata"].apply(
-                lambda x: ast.literal_eval(x) if isinstance(x, str) else x
-            )
-            quotes_df["job_type"] = quotes_df["request_metadata"].apply(lambda x: x.get("job_type", ""))
-            quotes_df["order_size"] = quotes_df["request_metadata"].apply(lambda x: x.get("order_size", ""))
-            quotes_df["event_type"] = quotes_df["request_metadata"].apply(lambda x: x.get("event_type", ""))
+            metadata = [
+                ast.literal_eval(value) if isinstance(value, str) else value
+                for value in quotes_df["request_metadata"]
+            ]
+            quotes_df.loc[:, "request_metadata"] = metadata
+            quotes_df.loc[:, "job_type"] = [value.get("job_type", "") for value in metadata]
+            quotes_df.loc[:, "order_size"] = [value.get("order_size", "") for value in metadata]
+            quotes_df.loc[:, "event_type"] = [value.get("event_type", "") for value in metadata]
 
         # Retain only relevant columns
         quotes_df = quotes_df[[
@@ -215,6 +222,7 @@ def init_database(db_engine: Engine, seed: int = 137) -> Engine:
             "units": None,
             "price": 50000.0,
             "transaction_date": initial_date,
+            "cash_date": initial_date,
         })
 
         # Add one stock order transaction per inventory item
@@ -225,6 +233,7 @@ def init_database(db_engine: Engine, seed: int = 137) -> Engine:
                 "units": item["current_stock"],
                 "price": item["current_stock"] * item["unit_price"],
                 "transaction_date": initial_date,
+                "cash_date": initial_date,
             })
 
         # Commit transactions to database
@@ -245,10 +254,12 @@ def create_transaction(
     quantity: int,
     price: float,
     date: Union[str, datetime],
+    cash_date: Optional[Union[str, datetime]] = None,
 ) -> int:
     """
     This function records a transaction of type 'stock_orders' or 'sales' with a specified
-    item name, quantity, total price, and transaction date into the 'transactions' table of the database.
+    item name, quantity, total price, inventory transaction date, and cash date into
+    the 'transactions' table of the database.
 
     Args:
         item_name (str): The name of the item involved in the transaction.
@@ -256,6 +267,7 @@ def create_transaction(
         quantity (int): Number of units involved in the transaction.
         price (float): Total price of the transaction.
         date (str or datetime): Date of the transaction in ISO 8601 format.
+        cash_date (str or datetime, optional): Date cash changes. Defaults to `date`.
 
     Returns:
         int: The ID of the newly inserted transaction.
@@ -267,26 +279,35 @@ def create_transaction(
     try:
         # Convert datetime to ISO string if necessary
         date_str = date.isoformat() if isinstance(date, datetime) else date
+        cash_date_str = (
+            cash_date.isoformat() if isinstance(cash_date, datetime)
+            else cash_date or date_str
+        )
 
         # Validate transaction type
         if transaction_type not in {"stock_orders", "sales"}:
             raise ValueError("Transaction type must be 'stock_orders' or 'sales'")
 
-        # Prepare transaction record as a single-row DataFrame
-        transaction = pd.DataFrame([{
-            "item_name": item_name,
-            "transaction_type": transaction_type,
-            "units": quantity,
-            "price": price,
-            "transaction_date": date_str,
-        }])
-
-        # Insert the record into the database
-        transaction.to_sql("transactions", db_engine, if_exists="append", index=False)
-
-        # Fetch and return the ID of the inserted row
-        result = pd.read_sql("SELECT last_insert_rowid() as id", db_engine)
-        return int(result.iloc[0]["id"])
+        with db_engine.begin() as connection:
+            result = connection.execute(
+                text(
+                    """
+                    INSERT INTO transactions
+                        (item_name, transaction_type, units, price, transaction_date, cash_date)
+                    VALUES
+                        (:item_name, :transaction_type, :units, :price, :transaction_date, :cash_date)
+                    """
+                ),
+                {
+                    "item_name": item_name,
+                    "transaction_type": transaction_type,
+                    "units": quantity,
+                    "price": price,
+                    "transaction_date": date_str,
+                    "cash_date": cash_date_str,
+                },
+            )
+            return int(result.lastrowid)
 
     except Exception as e:
         print(f"Error creating transaction: {e}")
@@ -430,9 +451,9 @@ def get_cash_balance(as_of_date: Union[str, datetime]) -> float:
         if isinstance(as_of_date, datetime):
             as_of_date = as_of_date.isoformat()
 
-        # Query all transactions on or before the specified date
+        # Cash can change on a different date from the associated stock movement.
         transactions = pd.read_sql(
-            "SELECT * FROM transactions WHERE transaction_date <= :as_of_date",
+            "SELECT * FROM transactions WHERE cash_date <= :as_of_date",
             db_engine,
             params={"as_of_date": as_of_date},
         )
@@ -589,111 +610,920 @@ def search_quote_history(search_terms: List[str], limit: int = 5) -> List[Dict]:
 ########################
 
 
-# Set up and load your env parameters and instantiate your model.
+@tool
+def inventory_snapshot_tool(as_of_date: str) -> Dict[str, int]:
+    """Read the available inventory snapshot.
+
+    Args:
+        as_of_date: Inclusive inventory date in YYYY-MM-DD format.
+    """
+    return get_all_inventory(as_of_date)
 
 
-"""Set up tools for your agents to use, these should be methods that combine the database functions above
- and apply criteria to them to ensure that the flow of the system is correct."""
+@tool
+def item_stock_tool(item_name: str, as_of_date: str) -> int:
+    """Read the current stock for one catalog item.
+
+    Args:
+        item_name: Exact item name used by the catalog.
+        as_of_date: Inclusive inventory date in YYYY-MM-DD format.
+    """
+    result = get_stock_level(item_name, as_of_date)
+    return int(result["current_stock"].iloc[0])
 
 
-# Tools for inventory agent
+@tool
+def cash_balance_tool(as_of_date: str) -> float:
+    """Read the company's cash balance on a specified date.
+
+    Args:
+        as_of_date: Inclusive balance date in YYYY-MM-DD format.
+    """
+    return get_cash_balance(as_of_date)
 
 
-# Tools for quoting agent
+@tool
+def financial_report_tool(as_of_date: str) -> Dict:
+    """Generate the company's internal financial and inventory health report.
+
+    Args:
+        as_of_date: Inclusive report date in YYYY-MM-DD format.
+    """
+    return generate_financial_report(as_of_date)
 
 
-# Tools for ordering agent
+@tool
+def supplier_eta_tool(input_date_str: str, quantity: int) -> str:
+    """Estimate a supplier delivery date using the starter's local lead-time rule.
+
+    Args:
+        input_date_str: Requested order date in YYYY-MM-DD format.
+        quantity: Number of units to replenish.
+    """
+    return get_supplier_delivery_date(input_date_str, quantity)
 
 
-# Set up your agents and create an orchestration agent that will manage them.
+@tool
+def quote_history_tool(search_terms: List[str], limit: int = 5) -> List[Dict]:
+    """Find historical quotes related to the customer's request.
+
+    Args:
+        search_terms: Terms used to match customer requests and quote explanations.
+        limit: Maximum number of historical quotes to return.
+    """
+    return search_quote_history(search_terms, limit)
 
 
-# Run your test scenarios by writing them here. Make sure to keep track of them.
+@tool
+def transaction_tool(
+    item_name: str,
+    transaction_type: str,
+    quantity: int,
+    price: float,
+    date: str,
+    cash_date: Optional[str] = None,
+) -> int:
+    """Record a stock purchase or completed sale in the SQLite ledger.
+
+    Args:
+        item_name: Exact catalog item name.
+        transaction_type: Either stock_orders or sales.
+        quantity: Number of units in this transaction.
+        price: Total dollar amount for this transaction.
+        date: Inventory transaction date in YYYY-MM-DD format.
+        cash_date: Date cash changes; defaults to date.
+    """
+    return create_transaction(
+        item_name,
+        transaction_type,
+        quantity,
+        price,
+        date,
+        cash_date=cash_date,
+    )
+
+
+@tool
+def transaction_analysis_tool(as_of_date: str) -> Dict:
+    """Summarize completed inventory and sales transactions for the advisor.
+
+    Args:
+        as_of_date: Inclusive inventory transaction cutoff in YYYY-MM-DD format.
+    """
+    totals = pd.read_sql(
+        """
+        SELECT transaction_type, COUNT(*) AS transaction_count,
+               COALESCE(SUM(units), 0) AS units,
+               COALESCE(SUM(price), 0) AS amount
+        FROM transactions
+        WHERE transaction_date <= :as_of_date
+          AND (transaction_type != 'sales' OR item_name IS NOT NULL)
+        GROUP BY transaction_type
+        """,
+        db_engine,
+        params={"as_of_date": as_of_date},
+    )
+    top_sales = pd.read_sql(
+        """
+        SELECT item_name, SUM(units) AS units, SUM(price) AS revenue
+        FROM transactions
+        WHERE transaction_type = 'sales'
+          AND item_name IS NOT NULL
+          AND transaction_date <= :as_of_date
+        GROUP BY item_name
+        ORDER BY revenue DESC
+        LIMIT 5
+        """,
+        db_engine,
+        params={"as_of_date": as_of_date},
+    )
+    catalog = pd.read_sql("SELECT item_name, min_stock_level FROM inventory", db_engine)
+    low_stock = []
+    for item in catalog.to_dict(orient="records"):
+        stock = int(
+            get_stock_level(str(item["item_name"]), as_of_date)["current_stock"].iloc[0]
+        )
+        if stock <= int(item["min_stock_level"]):
+            low_stock.append(
+                {
+                    "item_name": str(item["item_name"]),
+                    "stock": stock,
+                    "minimum": int(item["min_stock_level"]),
+                }
+            )
+    return {
+        "transaction_totals": [
+            {
+                "transaction_type": str(row["transaction_type"]),
+                "transaction_count": int(row["transaction_count"]),
+                "units": int(row["units"]),
+                "amount": round(float(row["amount"]), 2),
+            }
+            for row in totals.to_dict(orient="records")
+        ],
+        "top_sales": [
+            {
+                "item_name": str(row["item_name"]),
+                "units": int(row["units"]),
+                "revenue": round(float(row["revenue"]), 2),
+            }
+            for row in top_sales.to_dict(orient="records")
+        ],
+        "low_stock": low_stock,
+    }
+
+
+UNIT_WORDS = (
+    r"(?:sheets?|reams?|rolls?|boxes?|packets?|packages?|packs?|pieces?|"
+    r"units?|items?)"
+)
+REQUEST_ITEM_PATTERN = re.compile(
+    rf"(?<![A-Za-z0-9.])(?P<quantity>\d[\d,]*)\s*"
+    rf"(?:(?:{UNIT_WORDS})\s+)?(?:of\s+)?"
+    r"(?P<description>[A-Za-z0-9][A-Za-z0-9%\s,()\"'’×x./-]*?)"
+    r"(?=(?:,\s*\d[\d,]*|,\s*along\s+with\s+\d[\d,]*|"
+    r"\s+(?:and|along\s+with)\s+\d[\d,]*|"
+    r"\n|;\s*\d[\d,]*|\s+for\s+(?:the|our|an|a|upcoming)\b|"
+    r"\s+by\s+(?:the\s+)?(?:January|February|March|April|May|June|July|"
+    r"August|September|October|November|December)\b|\.\s|$))",
+    re.IGNORECASE,
+)
+DEADLINE_PATTERN = re.compile(
+    r"\b(January|February|March|April|May|June|July|August|September|"
+    r"October|November|December)\s+(\d{1,2}),?\s+(\d{4})\b",
+    re.IGNORECASE,
+)
+
+
+def parse_requested_items(request: str) -> List[Dict[str, Union[str, int]]]:
+    """Extract quantities and item descriptions from the supplied text requests."""
+    items = []
+    for match in REQUEST_ITEM_PATTERN.finditer(request):
+        description = match.group("description").strip(" \t\r\n,.;:-")
+        description = re.sub(r"\s+", " ", description)
+        if description and not re.match(r"20\d{2}\b", description):
+            items.append(
+                {
+                    "quantity": int(match.group("quantity").replace(",", "")),
+                    "description": description,
+                }
+            )
+    return items
+
+
+def resolve_catalog_item(description: str) -> Tuple[Optional[str], str]:
+    """Map requested wording to a catalog item without inventing stock variants."""
+    value = description.lower().replace("×", "x")
+    value = re.sub(r"\s+", " ", value)
+
+    size = re.search(r"\bA[35]\b", description, re.IGNORECASE)
+    if size:
+        return None, f"{size.group(0).upper()} size is not represented in the catalog"
+    if "biodegradable" in value:
+        return None, "the catalog does not specify biodegradable product variants"
+    if "recycled" in value and "cardstock" in value:
+        return None, "the catalog has no recycled-cardstock variant"
+    if "kraft" in value and "envelope" in value:
+        return None, "the catalog does not identify kraft or recycled envelope variants"
+    if any(term in value for term in ("cardboard", "balloon", "ticket")):
+        return None, "the requested product is not in the catalog"
+
+    if "washi" in value:
+        return "Decorative adhesive tape (washi tape)", ""
+    if "streamer" in value:
+        return "Party streamers", ""
+    if "flyer" in value:
+        return "Flyers", ""
+    if "poster board" in value:
+        return "Large poster paper (24x36 inches)", ""
+    if "poster" in value:
+        if "220 gsm" in value:
+            return "220 gsm poster paper", ""
+        return None, "poster size or paper weight is not specific enough to match a catalog item"
+    if "heavyweight" in value:
+        return "Heavyweight paper", ""
+    if "cardstock" in value or "card stock" in value:
+        return "Cardstock", ""
+    if "construction paper" in value:
+        return "Construction paper", ""
+    if "napkin" in value:
+        return "Paper napkins", ""
+    if "paper cup" in value or re.search(r"\bcups?\b", value):
+        return "Paper cups", ""
+    if "paper plate" in value or re.search(r"\bplates?\b", value):
+        return "Paper plates", ""
+    if "envelope" in value:
+        return "Envelopes", ""
+    if "glossy" in value:
+        return "Glossy paper", ""
+    if "matte" in value:
+        return "Matte paper", ""
+    if "recycled" in value:
+        return "Recycled paper", ""
+    if "colored" in value or "colour" in value:
+        return "Colored paper", ""
+    if "standard copy" in value or "standard printer" in value:
+        return "Standard copy paper", ""
+    if "printer paper" in value or "printing paper" in value:
+        return "A4 paper" if "A4" in description.upper() else "Standard copy paper", ""
+    if re.search(r"\bA4\b", description, re.IGNORECASE):
+        return "A4 paper", ""
+
+    catalog_names = {item["item_name"].lower(): item["item_name"] for item in paper_supplies}
+    normalized = re.sub(r"[^a-z0-9 ]", " ", value)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    for name, catalog_name in catalog_names.items():
+        if name in normalized:
+            return catalog_name, ""
+    return None, "no matching item was found in the catalog"
+
+
+def requested_deadline(request: str, request_date: str) -> str:
+    match = DEADLINE_PATTERN.search(request)
+    if not match:
+        return request_date
+    month, day, year = match.groups()
+    return datetime.strptime(f"{month} {day} {year}", "%B %d %Y").strftime("%Y-%m-%d")
+
+
+class InventoryAgent:
+    """Own stock checks, restock feasibility, and inventory reservations."""
+
+    def __init__(self) -> None:
+        self.future_reservations: List[Dict[str, Union[str, int]]] = []
+        self.future_reorder_costs: List[Dict[str, Union[str, float]]] = []
+
+    def assess(
+        self,
+        requested_items: List[Dict[str, Union[str, int]]],
+        request_date: str,
+        deadline: str,
+    ) -> Dict:
+        inventory_snapshot_tool.forward(as_of_date=request_date)
+        errors = []
+        lines = []
+        planned_reorders = []
+        reserved_cash = sum(
+            float(commitment["cost"])
+            for commitment in self.future_reorder_costs
+            if str(commitment["date"]) > request_date
+        )
+        available_cash = cash_balance_tool.forward(as_of_date=request_date) - reserved_cash
+
+        if sum(int(item["quantity"]) for item in requested_items) >= 1000:
+            financial_report_tool.forward(as_of_date=request_date)
+
+        fulfillment_date = request_date
+        for requested_item in requested_items:
+            catalog_item, resolution_error = resolve_catalog_item(
+                str(requested_item["description"])
+            )
+            if catalog_item is None:
+                errors.append(f"{requested_item['description']}: {resolution_error}")
+                continue
+
+            quantity = int(requested_item["quantity"])
+            current_stock = item_stock_tool.forward(
+                item_name=catalog_item,
+                as_of_date=request_date,
+            )
+            reserved_units = sum(
+                int(reservation["quantity"])
+                for reservation in self.future_reservations
+                if reservation["item_name"] == catalog_item
+                and str(reservation["date"]) > request_date
+            )
+            available_stock = max(0, current_stock - reserved_units)
+            shortage = max(0, quantity - available_stock)
+            reorder_date = request_date
+
+            if shortage:
+                reorder_date = supplier_eta_tool.forward(
+                    input_date_str=request_date,
+                    quantity=shortage,
+                )
+                if reorder_date > deadline:
+                    errors.append(
+                        f"{catalog_item}: {shortage:,} additional units cannot arrive "
+                        f"by {deadline} (earliest estimated date {reorder_date})"
+                    )
+                    continue
+                entry = next(
+                    item for item in paper_supplies if item["item_name"] == catalog_item
+                )
+                planned_reorders.append(
+                    {
+                        "item_name": catalog_item,
+                        "quantity": shortage,
+                        "cost": round(shortage * float(entry["unit_price"]), 2),
+                        "date": reorder_date,
+                    }
+                )
+                available_stock += shortage
+
+            fulfillment_date = max(fulfillment_date, reorder_date)
+            entry = next(
+                item for item in paper_supplies if item["item_name"] == catalog_item
+            )
+            lines.append(
+                {
+                    "item_name": catalog_item,
+                    "quantity": quantity,
+                    "unit_price": float(entry["unit_price"]),
+                    "available_before_reorder": max(0, current_stock - reserved_units),
+                    "stock_at_assessment": current_stock,
+                }
+            )
+
+        reorder_total = round(sum(float(order["cost"]) for order in planned_reorders), 2)
+        if reorder_total > available_cash:
+            errors.append(
+                f"restocking costs ${reorder_total:,.2f}, exceeding available cash "
+                f"${max(0.0, available_cash):,.2f}"
+            )
+        return {
+            "feasible": not errors,
+            "errors": errors,
+            "lines": lines,
+            "reorders": planned_reorders if not errors else [],
+            "fulfillment_date": fulfillment_date,
+            "reorder_total": reorder_total,
+            "available_cash": available_cash,
+        }
+
+    def commit_reorders(self, plan: Dict) -> None:
+        for reorder in plan["reorders"]:
+            transaction_tool.forward(
+                item_name=str(reorder["item_name"]),
+                transaction_type="stock_orders",
+                quantity=int(reorder["quantity"]),
+                price=float(reorder["cost"]),
+                date=str(reorder["date"]),
+            )
+            if str(reorder["date"]) > str(plan["request_date"]):
+                self.future_reorder_costs.append(
+                    {"date": str(reorder["date"]), "cost": float(reorder["cost"])}
+                )
+
+    def reserve_order(self, plan: Dict) -> None:
+        delivery_date = str(plan["fulfillment_date"])
+        if delivery_date <= str(plan["request_date"]):
+            return
+        self.future_reservations.extend(
+            {
+                "item_name": str(line["item_name"]),
+                "quantity": int(line["quantity"]),
+                "date": delivery_date,
+            }
+            for line in plan["lines"]
+        )
+
+
+class QuoteAgent:
+    """Own history lookups, catalog price calculation, and bulk discounts."""
+
+    def create_quote(self, lines: List[Dict], customer_brief: Dict[str, str]) -> Dict:
+        history = []
+        for search_term in (
+            customer_brief.get("event", ""),
+            customer_brief.get("job", ""),
+            customer_brief.get("need_size", ""),
+        ):
+            if search_term:
+                history = quote_history_tool.forward(
+                    search_terms=[search_term],
+                    limit=5,
+                )
+                if history:
+                    break
+
+        subtotal = round(
+            sum(float(line["unit_price"]) * int(line["quantity"]) for line in lines),
+            2,
+        )
+        units = sum(int(line["quantity"]) for line in lines)
+        discount_rate = (
+            0.10 if units >= 5000 else 0.08 if units >= 1500 else 0.05 if units >= 500 else 0.0
+        )
+        discount = round(subtotal * discount_rate, 2)
+        if discount_rate:
+            price_rationale = (
+                f"A {discount_rate:.0%} volume discount applies to the "
+                f"{units:,}-unit request."
+            )
+        else:
+            price_rationale = (
+                f"The {units:,}-unit request is below the 500-unit volume-discount "
+                "threshold, so catalog prices apply without a volume discount."
+            )
+        if customer_brief.get("price_sensitive") == "true":
+            price_rationale += (
+                " Your request asked for price-conscious options; the quote uses "
+                "the available catalog prices and published volume tier."
+            )
+        return {
+            "subtotal": subtotal,
+            "discount_rate": discount_rate,
+            "discount": discount,
+            "total": round(subtotal - discount, 2),
+            "price_rationale": price_rationale,
+            "history_note": (
+                f"Found {len(history)} historical quote(s) for context."
+                if history
+                else "No comparable historical quote was found; catalog prices were used."
+            ),
+        }
+
+
+class OrderFulfillmentAgent:
+    """Own accepted-order validation and sale transactions."""
+
+    def complete(
+        self,
+        plan: Dict,
+        quote: Dict,
+        request_date: str,
+        inventory: InventoryAgent,
+    ) -> int:
+        for line in plan["lines"]:
+            stock = item_stock_tool.forward(
+                item_name=str(line["item_name"]),
+                as_of_date=request_date,
+            )
+            if stock < int(line["stock_at_assessment"]):
+                raise RuntimeError(
+                    f"Inventory changed during fulfillment for {line['item_name']}."
+                )
+
+        inventory.commit_reorders(plan)
+        remaining_discount = float(quote["discount"])
+        lines = plan["lines"]
+        for index, line in enumerate(lines):
+            if index == len(lines) - 1:
+                line_discount = remaining_discount
+            else:
+                fraction = (
+                    float(line["unit_price"]) * int(line["quantity"])
+                    / float(quote["subtotal"])
+                    if quote["subtotal"]
+                    else 0.0
+                )
+                line_discount = round(float(quote["discount"]) * fraction, 2)
+                remaining_discount = round(remaining_discount - line_discount, 2)
+            transaction_tool.forward(
+                item_name=str(line["item_name"]),
+                transaction_type="sales",
+                quantity=int(line["quantity"]),
+                price=round(
+                    float(line["unit_price"]) * int(line["quantity"]) - line_discount,
+                    2,
+                ),
+                date=str(plan["fulfillment_date"]),
+                cash_date=request_date,
+            )
+        inventory.reserve_order(plan)
+        return len(lines)
+
+
+class BusinessAdvisorAgent:
+    """Turn internal transaction and inventory trends into recommendations."""
+
+    def analyze(self, as_of_date: str, evaluation_results: List[Dict]) -> Dict:
+        analysis = transaction_analysis_tool.forward(as_of_date=as_of_date)
+        fulfilled_count = sum(bool(result["accepted"]) for result in evaluation_results)
+        rejected_results = [
+            result for result in evaluation_results if result["status"] == "rejected"
+        ]
+        catalog_rejections = sum(
+            "catalog" in str(result["response"]).lower()
+            or "represented" in str(result["response"]).lower()
+            for result in rejected_results
+        )
+        delivery_rejections = sum(
+            "requested delivery date" in str(result["response"]).lower()
+            for result in evaluation_results
+        )
+
+        recommendations = []
+        if analysis["low_stock"]:
+            low_stock_names = ", ".join(
+                f"{item['item_name']} ({item['stock']} on hand; minimum {item['minimum']})"
+                for item in analysis["low_stock"]
+            )
+            recommendations.append(
+                "Review reorder points for these items before accepting more large "
+                f"orders: {low_stock_names}."
+            )
+        if analysis["top_sales"]:
+            best_seller = analysis["top_sales"][0]
+            recommendations.append(
+                f"Prioritize replenishment planning for {best_seller['item_name']}, "
+                f"the leading recorded seller ({best_seller['units']:,} units; "
+                f"${best_seller['revenue']:,.2f} revenue)."
+            )
+        if catalog_rejections:
+            recommendations.append(
+                f"{catalog_rejections} sample requests were rejected for unsupported "
+                "catalog specifications. Review demand before adding variants, and "
+                "capture size/weight explicitly to avoid unfulfillable quotes."
+            )
+        if delivery_rejections:
+            recommendations.append(
+                f"{delivery_rejections} sample requests missed stated deadlines under "
+                "the local lead-time estimates. Compare actual supplier lead times "
+                "and consider offering a confirmed later delivery option."
+            )
+        if not recommendations:
+            recommendations.append(
+                "No low-stock or rejected-request signal was found; continue "
+                "monitoring sales mix and replenishment timing."
+            )
+
+        return {
+            "as_of_date": as_of_date,
+            "accepted_requests": fulfilled_count,
+            "rejected_requests": len(rejected_results),
+            "transaction_totals": analysis["transaction_totals"],
+            "top_sales": analysis["top_sales"],
+            "low_stock": analysis["low_stock"],
+            "recommendations": recommendations,
+        }
+
+
+class TerminalProgressDisplay:
+    """Show a compact staged progress animation only in an interactive terminal."""
+
+    def __init__(self, enabled: bool = True) -> None:
+        self.enabled = enabled
+        self.completed_steps = 0
+        self.total_steps = 4
+
+    def update(self, stage: str, detail: str) -> None:
+        if not self.enabled:
+            return
+        self.completed_steps = min(self.completed_steps + 1, self.total_steps)
+        progress = int(12 * self.completed_steps / self.total_steps)
+        bar = "#" * progress + "-" * (12 - progress)
+        line = f"[{bar}] {stage}: {detail}"
+        for frame in ("-", "\\", "|"):
+            print(f"\r\033[2K[{frame}{bar[1:]}] {stage}: working...", end="", flush=True)
+            time.sleep(0.035)
+        print(f"\r\033[2K{line}", flush=True)
+
+
+class ProjectOrchestrator:
+    """Coordinate specialists and advocate for explicit customer requirements."""
+
+    def __init__(self) -> None:
+        self.inventory_agent = InventoryAgent()
+        self.quote_agent = QuoteAgent()
+        self.order_agent = OrderFulfillmentAgent()
+        self.business_advisor = BusinessAdvisorAgent()
+
+    @staticmethod
+    def _prepare_customer_brief(
+        request: str,
+        request_date: str,
+        job: str,
+        event: str,
+        need_size: str,
+    ) -> Dict[str, str]:
+        """Translate stated customer context into negotiation inputs, not guesses."""
+        return {
+            "job": job.strip(),
+            "event": event.strip(),
+            "need_size": need_size.strip(),
+            "deadline": requested_deadline(request, request_date),
+            "price_sensitive": str(
+                bool(
+                    re.search(
+                        r"\b(affordable|budget|cheap(?:est)?|discount|lowest price|"
+                        r"price-conscious)\b",
+                        request,
+                        re.IGNORECASE,
+                    )
+                )
+            ).lower(),
+        }
+
+    def handle(
+        self,
+        request: str,
+        request_date: str,
+        job: str = "",
+        event: str = "",
+        need_size: str = "",
+        progress: Optional[Callable[[str, str], None]] = None,
+    ) -> Dict:
+        customer_brief = self._prepare_customer_brief(
+            request, request_date, job, event, need_size
+        )
+        if progress:
+            context = " / ".join(
+                value
+                for value in (customer_brief["job"], customer_brief["event"])
+                if value
+            ) or "customer request"
+            progress("Customer advocate", f"prepared {context} requirements")
+
+        parsed_items = parse_requested_items(request)
+        if not parsed_items:
+            if progress:
+                progress("Orchestrator", "request needs item names and quantities")
+            return {
+                "status": "needs_details",
+                "accepted": False,
+                "response": "Please specify each requested catalog item and its quantity.",
+                "total": 0.0,
+                "fulfillment_date": "",
+            }
+
+        for item in parsed_items:
+            catalog_item, reason = resolve_catalog_item(str(item["description"]))
+            if catalog_item is None:
+                if progress:
+                    progress("Inventory team", f"catalog check: {reason}")
+                return {
+                    "status": "rejected",
+                    "accepted": False,
+                    "response": (
+                        f"Unable to fulfill this request: {item['description']} — {reason}. "
+                        "No inventory or sales transactions were recorded."
+                    ),
+                    "total": 0.0,
+                    "fulfillment_date": "",
+                }
+
+        deadline = customer_brief["deadline"]
+        plan = self.inventory_agent.assess(parsed_items, request_date, deadline)
+        if progress:
+            progress(
+                "Inventory agent",
+                (
+                    f"feasible; estimated delivery {plan['fulfillment_date']}"
+                    if plan["feasible"]
+                    else "; ".join(plan["errors"])
+                ),
+            )
+        if not plan["feasible"]:
+            reasons = "; ".join(plan["errors"])
+            alternative_dates = re.findall(
+                r"earliest estimated date (\d{4}-\d{2}-\d{2})",
+                reasons,
+            )
+            if alternative_dates:
+                alternative_deadline = max(alternative_dates)
+                alternative_plan = self.inventory_agent.assess(
+                    parsed_items,
+                    request_date,
+                    alternative_deadline,
+                )
+                if alternative_plan["feasible"]:
+                    alternative_quote = self.quote_agent.create_quote(
+                        alternative_plan["lines"],
+                        customer_brief,
+                    )
+                    if progress:
+                        progress(
+                            "Customer advocate",
+                            f"negotiated an alternate delivery offer for {alternative_deadline}",
+                        )
+                        progress(
+                            "Quote agent",
+                            f"${alternative_quote['total']:,.2f} total at the alternate date",
+                        )
+                    alternate_items = ", ".join(
+                        f"{line['quantity']:,} {line['item_name']}"
+                        for line in alternative_plan["lines"]
+                    )
+                    return {
+                        "status": "quoted_alternative_pending_approval",
+                        "accepted": False,
+                        "response": (
+                            f"We cannot meet the requested delivery date of {deadline}: "
+                            f"{reasons}. For your {event or 'order'} request, we can offer "
+                            f"{alternate_items} for ${alternative_quote['total']:,.2f} "
+                            f"with estimated delivery by {alternative_deadline}. "
+                            f"{alternative_quote['price_rationale']} "
+                            "This is an alternative offer, not an order; reply to approve "
+                            "the later date."
+                        ),
+                        "total": alternative_quote["total"],
+                        "fulfillment_date": alternative_deadline,
+                    }
+            return {
+                "status": "rejected",
+                "accepted": False,
+                "response": (
+                    f"Unable to meet the requested delivery date of {deadline}: {reasons}. "
+                    "No transactions were recorded."
+                ),
+                "total": 0.0,
+                "fulfillment_date": "",
+            }
+
+        quote = self.quote_agent.create_quote(plan["lines"], customer_brief)
+        if progress:
+            progress(
+                "Quote agent",
+                f"${quote['total']:,.2f} total; {quote['price_rationale']}",
+            )
+        item_summary = ", ".join(
+            f"{line['quantity']:,} {line['item_name']}" for line in plan["lines"]
+        )
+        response = (
+            f"Quote for {item_summary}: subtotal ${quote['subtotal']:,.2f}; "
+            f"bulk discount {quote['discount_rate']:.0%} "
+            f"(-${quote['discount']:,.2f}); total ${quote['total']:,.2f}. "
+            f"{quote['price_rationale']} {quote['history_note']} "
+            f"Estimated delivery: {plan['fulfillment_date']}."
+        )
+        has_purchase_intent = bool(
+            re.search(r"\b(order|purchase|buy|confirm the order)\b", request, re.IGNORECASE)
+        )
+        if not has_purchase_intent:
+            if progress:
+                progress("Customer advocate", "quote ready; awaiting customer approval")
+            return {
+                "status": "quoted_pending_approval",
+                "accepted": False,
+                "response": response + " Reply with acceptance to place the order.",
+                "total": quote["total"],
+                "fulfillment_date": plan["fulfillment_date"],
+            }
+
+        plan["request_date"] = request_date
+        line_count = self.order_agent.complete(
+            plan,
+            quote,
+            request_date,
+            self.inventory_agent,
+        )
+        if progress:
+            progress(
+                "Fulfillment agent",
+                f"recorded {line_count} line items for {plan['fulfillment_date']}",
+            )
+        return {
+            "status": "fulfilled",
+            "accepted": True,
+            "response": (
+                response
+                + f" Order accepted and recorded for delivery by {plan['fulfillment_date']} "
+                f"({line_count} line items)."
+            ),
+            "total": quote["total"],
+            "fulfillment_date": plan["fulfillment_date"],
+        }
+
 
 def run_test_scenarios():
-    
-    print("Initializing Database...")
+    """Evaluate the system on the supplied sample requests and save a CSV report."""
+    print("Initializing database...")
     init_database()
     try:
-        quote_requests_sample = pd.read_csv("quote_requests_sample.csv")
-        quote_requests_sample["request_date"] = pd.to_datetime(
-            quote_requests_sample["request_date"], format="%m/%d/%y", errors="coerce"
-        )
-        quote_requests_sample.dropna(subset=["request_date"], inplace=True)
-        quote_requests_sample = quote_requests_sample.sort_values("request_date")
-    except Exception as e:
-        print(f"FATAL: Error loading test data: {e}")
-        return
+        requests_df = pd.read_csv(PROJECT_DIR / "quote_requests_sample.csv")
+        parsed_dates = []
+        for raw_date in requests_df["request_date"]:
+            try:
+                parsed_dates.append(
+                    datetime.strptime(str(raw_date), "%m/%d/%y").strftime("%Y-%m-%d")
+                )
+            except ValueError:
+                parsed_dates.append(None)
+        requests_df.loc[:, "request_date"] = parsed_dates
+        requests_df.dropna(subset=["request_date"], inplace=True)
+        requests_df = requests_df.sort_values("request_date")
+    except Exception as exc:
+        raise RuntimeError(f"Could not load the supplied test requests: {exc}") from exc
 
-    # Get initial state
-    initial_date = quote_requests_sample["request_date"].min().strftime("%Y-%m-%d")
-    report = generate_financial_report(initial_date)
-    current_cash = report["cash_balance"]
-    current_inventory = report["inventory_value"]
-
-    ############
-    ############
-    ############
-    # INITIALIZE YOUR MULTI AGENT SYSTEM HERE
-    ############
-    ############
-    ############
-
+    first_date = str(requests_df["request_date"].min())
+    initial_report = financial_report_tool.forward(as_of_date=first_date)
+    current_cash = float(initial_report["cash_balance"])
+    current_inventory = float(initial_report["inventory_value"])
+    orchestrator = ProjectOrchestrator()
     results = []
-    for idx, row in quote_requests_sample.iterrows():
-        request_date = row["request_date"].strftime("%Y-%m-%d")
 
-        print(f"\n=== Request {idx+1} ===")
+    for request_number, (_, row) in enumerate(requests_df.iterrows(), start=1):
+        request_date = str(row["request_date"])
+        progress_display = TerminalProgressDisplay(enabled=sys.stdout.isatty())
+        print(f"\n=== Request {request_number} ===")
         print(f"Context: {row['job']} organizing {row['event']}")
         print(f"Request Date: {request_date}")
         print(f"Cash Balance: ${current_cash:.2f}")
         print(f"Inventory Value: ${current_inventory:.2f}")
 
-        # Process request
-        request_with_date = f"{row['request']} (Date of request: {request_date})"
+        outcome = orchestrator.handle(
+            request=str(row["request"]),
+            request_date=request_date,
+            job=str(row["job"]),
+            event=str(row["event"]),
+            need_size=str(row.get("need_size", "")),
+            progress=progress_display.update,
+        )
+        response = str(outcome["response"])
 
-        ############
-        ############
-        ############
-        # USE YOUR MULTI AGENT SYSTEM TO HANDLE THE REQUEST
-        ############
-        ############
-        ############
-
-        # response = call_your_multi_agent_system(request_with_date)
-
-        # Update state
-        report = generate_financial_report(request_date)
-        current_cash = report["cash_balance"]
-        current_inventory = report["inventory_value"]
-
+        report = financial_report_tool.forward(as_of_date=request_date)
+        current_cash = float(report["cash_balance"])
+        current_inventory = float(report["inventory_value"])
+        print(f"Status: {outcome['status']}")
         print(f"Response: {response}")
         print(f"Updated Cash: ${current_cash:.2f}")
         print(f"Updated Inventory: ${current_inventory:.2f}")
 
         results.append(
             {
-                "request_id": idx + 1,
+                "request_id": request_number,
                 "request_date": request_date,
+                "job": row["job"],
+                "event": row["event"],
+                "status": outcome["status"],
+                "accepted": outcome["accepted"],
+                "fulfillment_date": outcome["fulfillment_date"],
+                "quoted_total": outcome["total"],
                 "cash_balance": current_cash,
                 "inventory_value": current_inventory,
                 "response": response,
             }
         )
 
-        time.sleep(1)
-
-    # Final report
-    final_date = quote_requests_sample["request_date"].max().strftime("%Y-%m-%d")
-    final_report = generate_financial_report(final_date)
+    last_date = str(requests_df["request_date"].max())
+    final_report = financial_report_tool.forward(as_of_date=last_date)
+    fulfilled = sum(bool(result["accepted"]) for result in results)
+    rejected = sum(result["status"] == "rejected" for result in results)
+    advisor_report = orchestrator.business_advisor.analyze(last_date, results)
     print("\n===== FINAL FINANCIAL REPORT =====")
     print(f"Final Cash: ${final_report['cash_balance']:.2f}")
     print(f"Final Inventory: ${final_report['inventory_value']:.2f}")
+    print(f"Orders fulfilled: {fulfilled}; requests rejected: {rejected}")
 
-    # Save results
-    pd.DataFrame(results).to_csv("test_results.csv", index=False)
+    print("\n===== INTERNAL BUSINESS ADVISOR =====")
+    for recommendation in advisor_report["recommendations"]:
+        print(f"- {recommendation}")
+    advisor_path = PROJECT_DIR / "business_advisor_report.txt"
+    advisor_lines = [
+        f"Business advisor analysis as of {last_date}",
+        f"Accepted sample requests: {advisor_report['accepted_requests']}",
+        f"Rejected sample requests: {advisor_report['rejected_requests']}",
+        "",
+        "Transaction totals:",
+    ]
+    advisor_lines.extend(
+        (
+            f"- {item['transaction_type']}: {item['transaction_count']} "
+            f"transactions, {item['units']:,} units, ${item['amount']:,.2f}"
+        )
+        for item in advisor_report["transaction_totals"]
+    )
+    advisor_lines.extend(["", "Recommendations:"])
+    advisor_lines.extend(f"- {item}" for item in advisor_report["recommendations"])
+    advisor_path.write_text("\n".join(advisor_lines) + "\n", encoding="utf-8")
+
+    results_path = PROJECT_DIR / "test_results.csv"
+    pd.DataFrame(results).to_csv(results_path, index=False)
+    print(f"Evaluation saved to {results_path}")
+    print(f"Advisor report saved to {advisor_path}")
     return results
 
-
 if __name__ == "__main__":
-    results = run_test_scenarios()
+    run_test_scenarios()

@@ -1,0 +1,240 @@
+MULTI-AGENT PAPER-SUPPLY ORDER SYSTEM
+Design and evaluation notes
+
+Framework and execution model
+--------------------------------
+The implementation uses smolagents 1.26.0 to define typed @tool interfaces
+around the supplied Python helpers. It stays within the five-agent limit:
+ProjectOrchestrator (including its Customer Advocate role), InventoryAgent,
+QuoteAgent, OrderFulfillmentAgent, and BusinessAdvisorAgent. They use
+deterministic control flow; no LLM, external supplier service, or API key is
+required. This makes the sample evaluation reproducible and runnable offline.
+The framework supplies tool schemas and the .forward interface; project code
+owns the agent decisions.
+
+Agent responsibilities and data flow
+-------------------------------------
+1. ProjectOrchestrator parses a customer's text into item quantities, rejects
+   unsupported catalog variants, identifies a stated deadline, and sequences
+   the specialists. It returns the quote, pending-approval result, fulfillment
+   confirmation, or a specific rejection reason. Its integrated Customer
+   Advocate role builds a brief from the supplied job, event, requested order
+   size, explicit deadline, and any stated price sensitivity. It shares those
+   terms with InventoryAgent and QuoteAgent instead of inventing a budget or
+   customer preference.
+
+2. InventoryAgent owns stock and replenishment feasibility. It checks
+   inventory, accounts for its in-memory future reservations and reorder
+   commitments, estimates local replenishment dates, and ensures the order's
+   replenishment cost fits the available cash. It reserves inventory only for
+   accepted future-dated orders.
+
+3. QuoteAgent owns catalog-price calculation, historical quote lookup, and
+   volume discounts. The current discount schedule is 5% for 500–1,499 total
+   units, 8% for 1,500–4,999, and 10% for 5,000 or more; smaller orders receive
+   no discount. Historical quotes are context only; the price calculation
+   remains based on catalog prices.
+
+4. OrderFulfillmentAgent handles accepted orders. It rechecks stock before
+   writing transactions, asks InventoryAgent to record planned replenishment,
+   allocates the quote discount over the lines, and records inventory sales
+   for the planned fulfillment date while recording customer cash at acceptance.
+   Planned restock inventory and its cash cost are dated at estimated arrival.
+
+5. BusinessAdvisorAgent runs after the sample evaluation, reads aggregate
+   transaction and inventory signals, and writes internal operational
+   recommendations to business_advisor_report.txt. This report is not included
+   in customer-facing responses.
+
+Flow: customer request -> orchestrator / Customer Advocate -> InventoryAgent
+feasibility -> QuoteAgent pricing and history -> (if the request expresses
+purchase intent) OrderFulfillmentAgent validation and transaction recording
+-> orchestrator response to customer. The Customer Advocate negotiates a later
+delivery offer with InventoryAgent and QuoteAgent when the requested deadline
+is infeasible but the estimated later date is feasible. The customer must
+explicitly approve that alternative; the system does not record an order for
+it. A request without purchase intent gets a quote marked
+quoted_pending_approval. The sample runner is single-turn and does not persist
+a quote for acceptance in a later run.
+
+In an interactive terminal, TerminalProgressDisplay builds a staged progress
+bar from completed customer-context, inventory, quote, and fulfillment/offer
+outputs. It is silent in non-interactive runs and adds no progress text to the
+customer response or CSV evaluation.
+
+The supplier helper only estimates a date from a local quantity-to-lead-time
+rule. It is not a live supplier connection and does not transmit a purchase
+order. A stock_orders transaction models planned replenishment in the local
+ledger; it is not confirmation from a supplier.
+
+Starter functions and helper usage
+----------------------------------
+generate_sample_inventory(paper_supplies, coverage, seed)
+  Generates reproducible inventory rows from the catalog. init_database calls
+  it to seed the project's local database.
+
+init_database(db_engine, seed)
+  Creates/resets the local SQLite tables and loads generated inventory and
+  supplied quote history. The evaluation runner calls it at the beginning.
+
+create_transaction(item_name, transaction_type, quantity, price, date, cash_date)
+  Inserts a validated stock_orders or sales row and returns its ID. Inventory
+  movement is recorded at date; cash effects are recorded at cash_date (which
+  defaults to date). transaction_tool wraps it for the agents; fulfillment
+  records the accepted sale on the planned delivery date and its cash receipt
+  on the acceptance date.
+
+get_all_inventory(as_of_date)
+  Returns positive net stock by item as of a date. inventory_snapshot_tool
+  exposes it to InventoryAgent.
+
+get_stock_level(item_name, as_of_date)
+  Returns net stock for one item. item_stock_tool exposes it to InventoryAgent
+  for planning and to OrderFulfillmentAgent for pre-write validation.
+
+get_supplier_delivery_date(input_date_str, quantity)
+  Estimates a delivery date using the starter's quantity-based lead time.
+  supplier_eta_tool exposes the estimate to InventoryAgent.
+
+get_cash_balance(as_of_date)
+  Calculates customer receipts less stock-purchase payments through a date,
+  using each transaction's cash_date.
+  cash_balance_tool exposes it to InventoryAgent's affordability check.
+
+generate_financial_report(as_of_date)
+  Calculates cash, inventory value, total assets, itemized inventory, and top
+  sellers. financial_report_tool wraps this helper as a smolagents tool. The
+  evaluation runner uses the tool before and after requests; the InventoryAgent
+  also requests a report for large orders (1,000+ units).
+
+search_quote_history(search_terms, limit)
+  Finds similar historical quote rows. quote_history_tool exposes it to
+  QuoteAgent; results are summarized in the customer-facing quote.
+
+Project-specific tools and decision helpers
+--------------------------------------------
+inventory_snapshot_tool -> get_all_inventory: date-specific stock snapshot.
+item_stock_tool -> get_stock_level: per-item planning and validation check.
+cash_balance_tool -> get_cash_balance: affordability input.
+financial_report_tool -> generate_financial_report: internal financial and
+  inventory health report.
+supplier_eta_tool -> get_supplier_delivery_date: local ETA estimate only.
+quote_history_tool -> search_quote_history: relevant quote-history context.
+transaction_tool -> create_transaction: local stock_orders and sales ledger.
+transaction_analysis_tool -> SQLite transaction aggregates plus get_stock_level:
+  internal sales, replenishment, top-item, and low-stock analysis for the
+  BusinessAdvisorAgent.
+
+parse_requested_items extracts quantities and descriptions from the sample
+request wording. resolve_catalog_item maps descriptions conservatively to
+known catalog names and rejects unsupported sizes/specifications rather than
+inventing variants. requested_deadline parses an explicit month/day/year
+deadline, otherwise using the request date.
+
+The Customer Advocate role in ProjectOrchestrator._prepare_customer_brief
+passes supplied job/event/order-size context, explicit deadlines, and explicit
+price-sensitive language to the worker agents. If InventoryAgent reports a
+deadline conflict, the orchestrator retries the plan at the latest local ETA
+and presents a priced later-date offer when feasible. It never treats that
+counter-offer as accepted.
+
+InventoryAgent.assess builds a feasible stock/reorder plan and reports
+shortages, timing, and cash constraints. commit_reorders writes planned local
+stock_orders transactions after acceptance. reserve_order tracks future
+reservations within the current evaluation run.
+
+QuoteAgent.create_quote looks up history, totals catalog prices, and applies
+the stated unit-volume discount schedule.
+
+OrderFulfillmentAgent.complete rechecks stock, commits planned restocks,
+records sales with the discount allocated across lines, and reserves future
+inventory.
+
+ProjectOrchestrator.handle coordinates parsing, catalog checks, planning,
+quoting, purchase-intent handling, fulfillment, and the response. The
+run_test_scenarios function initializes the database, executes the supplied
+requests in date order, records financial snapshots and outcomes, prints the
+final report, and writes test_results.csv. It also invokes BusinessAdvisorAgent
+and writes the separate internal business_advisor_report.txt.
+
+Evaluation
+----------
+Dataset: quote_requests_sample.csv (20 requests).
+Result: 4 fulfilled, 12 rejected, 1 quoted_pending_approval, and 3
+quoted_alternative_pending_approval offers.
+The minimum acceptance criteria are met: at least three fulfilled orders and
+at least one clearly explained unfulfilled request. Four accepted sample
+orders each changed the cash balance by the quoted total on the request date.
+
+Fulfilled request IDs: 5, 6, 11, and 12. Their quoted totals were $128.25,
+$73.15, $49.40, and $137.75. Request 1 received a $65.00 quote and remained
+pending approval because it did not express purchase intent. Requests 10, 16,
+and 18 received priced offers for later delivery dates (April 12, April 17,
+and April 18 respectively); these remain unaccepted offers and do not record
+sales or restock transactions.
+
+The remaining rejections explain that requested sizes/specifications are not
+in the available catalog. In particular, the system rejects A3/A5 variants
+rather than silently substituting another size. The later-date counter-offers
+show how the integrated Customer Advocate can negotiate around a missed
+deadline without pretending the original schedule is feasible. The supplied
+data exercises catalog validation, mixed stock/reorder planning, deadline
+negotiation, discounts, quote history, pending approval, and transaction
+recording.
+
+The final date-based financial report for 2025-04-17 reports cash of
+$45,278.50 and inventory value of $4,701.05. Customer payment is booked when
+an order is accepted, while inventory sales and planned replenishment are
+dated at fulfillment/estimated arrival. This keeps the available-stock
+timeline separate from the cash timeline. All four fulfilled requests (5, 6,
+11, and 12) increase cash on their request dates by their quoted totals.
+Rows 14 and 15 show cash decreases of $42.00 and $127.75 because restock costs
+from earlier accepted requests reach their estimated dates then; those rejected
+requests themselves record no transactions. The CSV documents both the cash
+timing and these delayed costs.
+
+The internal Business Advisor reported 11 sales transactions totaling
+$388.55, identified Cardstock as the leading recorded seller, and flagged
+Glossy paper and Cardstock below their configured minimum levels. It also
+recommended reviewing catalog demand after 12 unsupported-specification
+rejections and validating supplier lead times after three deadline conflicts.
+These are internal findings, not customer-facing information.
+
+Strengths and limitations
+-------------------------
+Strengths: the sample run is deterministic and offline; the responsibilities
+are separated; all supplied functional helpers are used; rejections include
+specific reasons; unsupported products are not silently substituted; and
+future stock/cash commitments are considered during planning. Requests 10,
+16, and 18 receive an explicit later-date price offer instead of silently
+ignoring the customer's deadline, and the customer has to approve the changed
+date before fulfillment.
+The interactive terminal progress display reveals completed agent stages;
+the Business Advisor's aggregate findings remain separate from customer
+responses.
+
+Limitations: item parsing is rule-based and tailored to the supplied request
+patterns; the catalog has no A3/A5 or several requested specialty variants;
+the local ETA is not supplier confirmation; future reservations exist only in
+memory and do not coordinate multiple application processes; and a pending
+quote or later-date counter-offer cannot be accepted in a later turn by the
+current runner. The sample set still has 12 rejections, primarily because the
+requests ask for product sizes/specifications not represented in the catalog.
+
+Suggested improvements
+----------------------
+1. Add a persisted quote/order state machine so customers can accept or revise
+   a quote in a later turn, with idempotency keys and transaction-safe stock
+   reservation.
+2. Integrate an authenticated supplier API and purchase-order workflow; replace
+   the local lead-time estimate with supplier availability, confirmed dates,
+   and explicit failure handling.
+3. Expand catalog matching with structured product attributes and targeted
+   clarification questions, then add catalog entries only when product
+   specifications and pricing are approved.
+4. Add focused automated tests for parsing variations, boundary discount
+   tiers, cash exhaustion, deadline edges, duplicate requests, and rollback
+   behavior after a transaction failure.
+5. Validate Business Advisor recommendations against a longer operating
+   history and track whether inventory or catalog changes actually improve
+   fulfillment rate, lead times, and revenue.
