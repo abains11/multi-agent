@@ -1,0 +1,17 @@
+flowchart LR
+    C[Customer text request] --> M[ProjectOrchestrator<br/>smolagents ToolCallingAgent<br/>Customer Advocate integrated]
+    M -->|ManagedAgent delegation| I[Inventory specialist<br/>ToolCallingAgent]
+    M -->|ManagedAgent delegation| Q[Quote specialist<br/>ToolCallingAgent]
+    M -->|ManagedAgent delegation| F[Fulfillment specialist<br/>ToolCallingAgent]
+    I --> IT[Inventory feasibility and reservation tools]
+    Q --> QT[Historical quote and deterministic pricing tools]
+    F --> FT[Transaction validation and ledger tools]
+    I --> DB[(SQLite inventory and cash ledger)]
+    Q --> DB
+    F --> DB
+    M --> R[Customer quote, offer, or order response]
+
+    E[Completed sample evaluation] -->|Internal-only delegated report| A[Business Advisor<br/>ToolCallingAgent]
+    A --> AT[Aggregate transaction analysis tool]
+    AT --> DB
+    A --> AR[Internal business advisor report]

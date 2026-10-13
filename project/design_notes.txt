@@ -3,14 +3,28 @@ Design and evaluation notes
 
 Framework and execution model
 --------------------------------
-The implementation uses smolagents 1.26.0 to define typed @tool interfaces
-around the supplied Python helpers. It stays within the five-agent limit:
-ProjectOrchestrator (including its Customer Advocate role), InventoryAgent,
-QuoteAgent, OrderFulfillmentAgent, and BusinessAdvisorAgent. They use
-deterministic control flow; no LLM, external supplier service, or API key is
-required. This makes the sample evaluation reproducible and runnable offline.
-The framework supplies tool schemas and the .forward interface; project code
-owns the agent decisions.
+The implementation uses smolagents 1.26.0 agent and delegation constructs. It
+stays within the five-agent limit: a ProjectOrchestrator ToolCallingAgent with
+four managed ToolCallingAgent specialists for inventory, quoting, fulfillment,
+and internal business advice. The Customer Advocate role is integrated into
+the orchestrator. Each specialist registers a business-action tool that calls
+the existing deterministic domain method; pricing, feasibility, reservations,
+and transaction validation remain in those methods.
+
+ProjectOrchestrator.handle retains the deterministic business policy and asks
+its smolagents manager agent to delegate each specialist action. The manager
+delegates through smolagents' managed_agents mechanism; each specialist then
+executes its registered tool through the ToolCallingAgent run loop. A local
+DeterministicWorkflowModel implements the smolagents Model interface and maps
+structured workflow envelopes to framework tool calls. It does not provide
+free-form language reasoning or choose business policy. This keeps the full
+framework execution path testable without sending customer sample text or
+credentials to an external model service. The system makes no LLM or external
+supplier-service calls.
+
+The editable workflow diagram is Agent_workflow.mmd; Agent_workflow.png is its
+rendered submission image. The internal Business Advisor remains a distinct
+managed specialist and is called only after the sample evaluation.
 
 Agent responsibilities and data flow
 -------------------------------------
@@ -46,16 +60,19 @@ Agent responsibilities and data flow
    recommendations to business_advisor_report.txt. This report is not included
    in customer-facing responses.
 
-Flow: customer request -> orchestrator / Customer Advocate -> InventoryAgent
-feasibility -> QuoteAgent pricing and history -> (if the request expresses
-purchase intent) OrderFulfillmentAgent validation and transaction recording
--> orchestrator response to customer. The Customer Advocate negotiates a later
-delivery offer with InventoryAgent and QuoteAgent when the requested deadline
-is infeasible but the estimated later date is feasible. The customer must
-explicitly approve that alternative; the system does not record an order for
-it. A request without purchase intent gets a quote marked
+Flow: customer request -> ProjectOrchestrator ToolCallingAgent and integrated
+Customer Advocate -> smolagents managed delegation to the Inventory
+specialist -> managed delegation to the Quote specialist -> (if purchase
+intent is explicit) managed delegation to the Fulfillment specialist ->
+orchestrator response to the customer. When the requested deadline is
+infeasible but a later estimated date is feasible, the orchestrator delegates
+the revised feasibility and price check and offers the later date. The
+customer must explicitly approve that alternative; the system does not
+record an order for it. A request without purchase intent gets a quote marked
 quoted_pending_approval. The sample runner is single-turn and does not persist
-a quote for acceptance in a later run.
+a quote for acceptance in a later run. After evaluation, the manager delegates
+aggregate results to the internal-only Business Advisor; advisor output is
+written to business_advisor_report.txt and is not exposed in customer replies.
 
 In an interactive terminal, TerminalProgressDisplay builds a staged progress
 bar from completed customer-context, inventory, quote, and fulfillment/offer
@@ -123,7 +140,15 @@ quote_history_tool -> search_quote_history: relevant quote-history context.
 transaction_tool -> create_transaction: local stock_orders and sales ledger.
 transaction_analysis_tool -> SQLite transaction aggregates plus get_stock_level:
   internal sales, replenishment, top-item, and low-stock analysis for the
-  BusinessAdvisorAgent.
+  Business Advisor specialist.
+
+BusinessActionTool registers each specialist's existing business operation
+as a smolagents tool. DeterministicWorkflowModel produces native smolagents
+tool calls from the structured task supplied by ProjectOrchestrator; the
+manager agent invokes each ToolCallingAgent specialist through managed_agents.
+The custom model is a local workflow adapter, not a mocked agent call: both
+manager and worker ToolCallingAgent.run loops execute for every delegated
+action in the full sample evaluation.
 
 parse_requested_items extracts quantities and descriptions from the sample
 request wording. resolve_catalog_item maps descriptions conservatively to
@@ -139,7 +164,8 @@ and presents a priced later-date offer when feasible. It never treats that
 counter-offer as accepted.
 
 InventoryAgent.assess builds a feasible stock/reorder plan and reports
-shortages, timing, and cash constraints. commit_reorders writes planned local
+shortages, timing, and cash constraints; the Inventory specialist exposes it
+through its framework action tool. commit_reorders writes planned local
 stock_orders transactions after acceptance. reserve_order tracks future
 reservations within the current evaluation run.
 
@@ -154,8 +180,9 @@ ProjectOrchestrator.handle coordinates parsing, catalog checks, planning,
 quoting, purchase-intent handling, fulfillment, and the response. The
 run_test_scenarios function initializes the database, executes the supplied
 requests in date order, records financial snapshots and outcomes, prints the
-final report, and writes test_results.csv. It also invokes BusinessAdvisorAgent
-and writes the separate internal business_advisor_report.txt.
+final report, and writes test_results.csv. It delegates the aggregate analysis
+to the Business Advisor specialist and writes the separate internal
+business_advisor_report.txt.
 
 Evaluation
 ----------
@@ -202,24 +229,31 @@ These are internal findings, not customer-facing information.
 
 Strengths and limitations
 -------------------------
-Strengths: the sample run is deterministic and offline; the responsibilities
-are separated; all supplied functional helpers are used; rejections include
-specific reasons; unsupported products are not silently substituted; and
-future stock/cash commitments are considered during planning. Requests 10,
-16, and 18 receive an explicit later-date price offer instead of silently
-ignoring the customer's deadline, and the customer has to approve the changed
-date before fulfillment.
+Strengths: all five runtime agents are smolagents ToolCallingAgent instances,
+and each manager-to-specialist action in the full sample run uses framework
+managed-agent delegation and a specialist-registered tool. Deterministic
+business rules remain behind those tools. Rejections include specific
+reasons; unsupported products are not silently substituted; and future
+stock/cash commitments are considered during planning. Requests 10, 16, and
+18 receive an explicit later-date price offer instead of silently ignoring
+the customer's deadline, and the customer has to approve the changed date
+before fulfillment.
 The interactive terminal progress display reveals completed agent stages;
 the Business Advisor's aggregate findings remain separate from customer
-responses.
+responses. The local workflow model keeps the framework execution reproducible
+without external requests, but intentionally does not use an LLM for free-form
+planning or natural-language routing.
 
 Limitations: item parsing is rule-based and tailored to the supplied request
 patterns; the catalog has no A3/A5 or several requested specialty variants;
 the local ETA is not supplier confirmation; future reservations exist only in
 memory and do not coordinate multiple application processes; and a pending
 quote or later-date counter-offer cannot be accepted in a later turn by the
-current runner. The sample set still has 12 rejections, primarily because the
-requests ask for product sizes/specifications not represented in the catalog.
+current runner. DeterministicWorkflowModel accepts structured requests from
+the business orchestrator rather than deciding which specialist is needed
+from free-form text. The sample set still has 12 rejections, primarily because
+the requests ask for product sizes/specifications not represented in the
+catalog.
 
 Suggested improvements
 ----------------------

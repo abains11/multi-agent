@@ -1,15 +1,26 @@
 import pandas as pd
 import numpy as np
 import ast
+import json
 import re
 import sys
 import time
 from pathlib import Path
 from sqlalchemy.sql import text
 from datetime import datetime, timedelta
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from sqlalchemy import create_engine, Engine
-from smolagents import tool
+from smolagents import (
+    ChatMessage,
+    ChatMessageToolCall,
+    MessageRole,
+    Model,
+    Tool,
+    ToolCallingAgent,
+    tool,
+)
+from smolagents.monitoring import LogLevel
+from smolagents.models import ChatMessageToolCallFunction
 
 PROJECT_DIR = Path(__file__).resolve().parent
 
@@ -1190,6 +1201,137 @@ class BusinessAdvisorAgent:
         }
 
 
+class BusinessActionTool(Tool):
+    """Expose a specialist's deterministic business actions as a framework tool."""
+
+    name = "run_business_action"
+    description = "Execute one validated deterministic action for this specialist."
+    inputs = {
+        "task_json": {
+            "type": "string",
+            "description": "JSON object containing the action name and its arguments.",
+        }
+    }
+    output_type = "string"
+
+    def __init__(
+        self,
+        handler: Callable[[str, Dict[str, Any]], Any],
+    ) -> None:
+        super().__init__()
+        self.handler = handler
+
+    def forward(self, task_json: str) -> str:
+        task = json.loads(task_json)
+        if not isinstance(task, dict):
+            raise ValueError("Business action payload must be a JSON object.")
+        action = task.get("action")
+        arguments = task.get("arguments")
+        if not isinstance(action, str) or not isinstance(arguments, dict):
+            raise ValueError("Business action payload requires an action and arguments object.")
+        return json.dumps(self.handler(action, arguments))
+
+
+class DeterministicWorkflowModel(Model):
+    """Translate structured workflow requests into smolagents tool calls locally."""
+
+    def __init__(self) -> None:
+        super().__init__(model_id="local-deterministic-workflow")
+        self.call_number = 0
+
+    @staticmethod
+    def _text(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "".join(
+                str(part.get("text", ""))
+                for part in content
+                if isinstance(part, dict)
+            )
+        return "" if content is None else str(content)
+
+    def _tool_call(self, name: str, arguments: Dict[str, Any]) -> ChatMessage:
+        self.call_number += 1
+        return ChatMessage(
+            role=MessageRole.ASSISTANT,
+            tool_calls=[
+                ChatMessageToolCall(
+                    function=ChatMessageToolCallFunction(
+                        name=name,
+                        arguments=arguments,
+                    ),
+                    id=f"workflow-call-{self.call_number}",
+                    type="function",
+                )
+            ],
+        )
+
+    def generate(
+        self,
+        messages: List[ChatMessage],
+        tools_to_call_from: Optional[List[Any]] = None,
+        **kwargs: Any,
+    ) -> ChatMessage:
+        unsupported_options = set(kwargs) - {"stop_sequences"}
+        if unsupported_options:
+            raise ValueError(
+                "Unsupported deterministic-model options: "
+                + ", ".join(sorted(unsupported_options))
+            )
+        tool_options = {tool.name: tool for tool in (tools_to_call_from or [])}
+        for message in reversed(messages):
+            if getattr(message.role, "value", message.role) == MessageRole.TOOL_RESPONSE.value:
+                observation = self._text(message.content)
+                if observation.startswith("Observation:\n"):
+                    observation = observation[len("Observation:\n") :]
+                return self._tool_call(
+                    "final_answer",
+                    {"answer": observation},
+                )
+
+        user_message = next(
+            (
+                message
+                for message in reversed(messages)
+                if getattr(message.role, "value", message.role) == MessageRole.USER.value
+            ),
+            None,
+        )
+        if user_message is None:
+            raise RuntimeError("Framework agent received no workflow task.")
+
+        task_text = self._text(user_message.content)
+        if task_text.startswith("New task:\n"):
+            task_text = task_text[len("New task:\n") :]
+        try:
+            request = json.loads(task_text)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Framework agent task must be a JSON workflow request.") from exc
+        if not isinstance(request, dict):
+            raise ValueError("Framework agent task must be a JSON object.")
+
+        if "agent" in request:
+            agent_name = request["agent"]
+            if not isinstance(agent_name, str) or agent_name not in tool_options:
+                raise ValueError(f"Unknown managed specialist: {agent_name!r}.")
+            task = request.get("task")
+            if not isinstance(task, str):
+                raise ValueError("Managed specialist requests require a string task.")
+            return self._tool_call(
+                agent_name,
+                {"task": task, "additional_args": None},
+            )
+
+        specialist_tool = "run_business_action"
+        if specialist_tool not in tool_options:
+            raise ValueError("The specialist has no business-action tool registered.")
+        return self._tool_call(
+            specialist_tool,
+            {"task_json": task_text},
+        )
+
+
 class TerminalProgressDisplay:
     """Show a compact staged progress animation only in an interactive terminal."""
 
@@ -1219,6 +1361,148 @@ class ProjectOrchestrator:
         self.quote_agent = QuoteAgent()
         self.order_agent = OrderFulfillmentAgent()
         self.business_advisor = BusinessAdvisorAgent()
+        self.workflow_model = DeterministicWorkflowModel()
+        self.inventory_worker = self._create_specialist(
+            "inventory_specialist",
+            "Checks stock, estimates replenishment, and evaluates cash feasibility.",
+            self._run_inventory_action,
+        )
+        self.quote_worker = self._create_specialist(
+            "quote_specialist",
+            "Looks up quote history and calculates deterministic catalog pricing.",
+            self._run_quote_action,
+        )
+        self.fulfillment_worker = self._create_specialist(
+            "fulfillment_specialist",
+            "Validates accepted orders and records the corresponding transactions.",
+            self._run_fulfillment_action,
+        )
+        self.advisor_worker = self._create_specialist(
+            "business_advisor",
+            "Creates internal-only operational recommendations from aggregate results.",
+            self._run_advisor_action,
+        )
+        self.agent = ToolCallingAgent(
+            tools=[],
+            model=self.workflow_model,
+            managed_agents=[
+                self.inventory_worker,
+                self.quote_worker,
+                self.fulfillment_worker,
+                self.advisor_worker,
+            ],
+            name="project_orchestrator",
+            description="Delegates each deterministic business action to its specialist.",
+            instructions=(
+                "Delegate the structured request to the named specialist. Do not make "
+                "business decisions or alter its result."
+            ),
+            max_steps=2,
+            verbosity_level=LogLevel.ERROR,
+        )
+        self.agent.prompt_templates["managed_agent"]["task"] = "{{task}}"
+        self.agent.prompt_templates["managed_agent"]["report"] = "{{final_answer}}"
+
+    def _create_specialist(
+        self,
+        name: str,
+        description: str,
+        handler: Callable[[str, Dict[str, Any]], Any],
+    ) -> ToolCallingAgent:
+        agent = ToolCallingAgent(
+            tools=[BusinessActionTool(handler)],
+            model=self.workflow_model,
+            name=name,
+            description=description,
+            instructions=(
+                "Execute the one structured business action provided in the task "
+                "using run_business_action, then return its result unchanged."
+            ),
+            max_steps=2,
+            verbosity_level=LogLevel.ERROR,
+        )
+        agent.prompt_templates["managed_agent"]["task"] = "{{task}}"
+        agent.prompt_templates["managed_agent"]["report"] = "{{final_answer}}"
+        return agent
+
+    def _run_inventory_action(self, action: str, arguments: Dict[str, Any]) -> Any:
+        if action == "assess":
+            return self.inventory_agent.assess(
+                arguments["requested_items"],
+                arguments["request_date"],
+                arguments["deadline"],
+            )
+        if action == "commit_reorders":
+            return self.inventory_agent.commit_reorders(arguments["plan"])
+        if action == "reserve_order":
+            return self.inventory_agent.reserve_order(arguments["plan"])
+        raise ValueError(f"Unknown inventory action: {action}.")
+
+    def _run_quote_action(self, action: str, arguments: Dict[str, Any]) -> Any:
+        if action != "create_quote":
+            raise ValueError(f"Unknown quote action: {action}.")
+        return self.quote_agent.create_quote(
+            arguments["lines"],
+            arguments["customer_brief"],
+        )
+
+    def _run_fulfillment_action(self, action: str, arguments: Dict[str, Any]) -> Any:
+        if action != "complete":
+            raise ValueError(f"Unknown fulfillment action: {action}.")
+        return self.order_agent.complete(
+            arguments["plan"],
+            arguments["quote"],
+            arguments["request_date"],
+            self.inventory_agent,
+        )
+
+    def _run_advisor_action(self, action: str, arguments: Dict[str, Any]) -> Any:
+        if action != "analyze":
+            raise ValueError(f"Unknown business-advisor action: {action}.")
+        return self.business_advisor.analyze(
+            arguments["as_of_date"],
+            arguments["evaluation_results"],
+        )
+
+    def _delegate(
+        self,
+        agent_name: str,
+        action: str,
+        arguments: Dict[str, Any],
+    ) -> Any:
+        task = json.dumps({"action": action, "arguments": arguments})
+        result = self.agent.run(
+            json.dumps({"agent": agent_name, "task": task})
+        )
+        if not isinstance(result, str):
+            raise TypeError(
+                f"Framework delegation to {agent_name} returned "
+                f"{type(result).__name__}, expected serialized JSON."
+            )
+        try:
+            return json.loads(result)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"Framework delegation to {agent_name} returned invalid JSON."
+            ) from exc
+
+    def analyze_business(
+        self,
+        as_of_date: str,
+        evaluation_results: List[Dict],
+    ) -> Dict:
+        """Delegate internal evaluation results to the internal-only advisor."""
+        result = self._delegate(
+            "business_advisor",
+            "analyze",
+            {
+                "as_of_date": as_of_date,
+                "evaluation_results": evaluation_results,
+            },
+        )
+        if not isinstance(result, dict):
+            raise TypeError("Business advisor must return a JSON object.")
+        return result
 
     @staticmethod
     def _prepare_customer_brief(
@@ -1295,7 +1579,15 @@ class ProjectOrchestrator:
                 }
 
         deadline = customer_brief["deadline"]
-        plan = self.inventory_agent.assess(parsed_items, request_date, deadline)
+        plan = self._delegate(
+            "inventory_specialist",
+            "assess",
+            {
+                "requested_items": parsed_items,
+                "request_date": request_date,
+                "deadline": deadline,
+            },
+        )
         if progress:
             progress(
                 "Inventory agent",
@@ -1313,15 +1605,23 @@ class ProjectOrchestrator:
             )
             if alternative_dates:
                 alternative_deadline = max(alternative_dates)
-                alternative_plan = self.inventory_agent.assess(
-                    parsed_items,
-                    request_date,
-                    alternative_deadline,
+                alternative_plan = self._delegate(
+                    "inventory_specialist",
+                    "assess",
+                    {
+                        "requested_items": parsed_items,
+                        "request_date": request_date,
+                        "deadline": alternative_deadline,
+                    },
                 )
                 if alternative_plan["feasible"]:
-                    alternative_quote = self.quote_agent.create_quote(
-                        alternative_plan["lines"],
-                        customer_brief,
+                    alternative_quote = self._delegate(
+                        "quote_specialist",
+                        "create_quote",
+                        {
+                            "lines": alternative_plan["lines"],
+                            "customer_brief": customer_brief,
+                        },
                     )
                     if progress:
                         progress(
@@ -1362,7 +1662,14 @@ class ProjectOrchestrator:
                 "fulfillment_date": "",
             }
 
-        quote = self.quote_agent.create_quote(plan["lines"], customer_brief)
+        quote = self._delegate(
+            "quote_specialist",
+            "create_quote",
+            {
+                "lines": plan["lines"],
+                "customer_brief": customer_brief,
+            },
+        )
         if progress:
             progress(
                 "Quote agent",
@@ -1393,11 +1700,14 @@ class ProjectOrchestrator:
             }
 
         plan["request_date"] = request_date
-        line_count = self.order_agent.complete(
-            plan,
-            quote,
-            request_date,
-            self.inventory_agent,
+        line_count = self._delegate(
+            "fulfillment_specialist",
+            "complete",
+            {
+                "plan": plan,
+                "quote": quote,
+                "request_date": request_date,
+            },
         )
         if progress:
             progress(
@@ -1491,7 +1801,7 @@ def run_test_scenarios():
     final_report = financial_report_tool.forward(as_of_date=last_date)
     fulfilled = sum(bool(result["accepted"]) for result in results)
     rejected = sum(result["status"] == "rejected" for result in results)
-    advisor_report = orchestrator.business_advisor.analyze(last_date, results)
+    advisor_report = orchestrator.analyze_business(last_date, results)
     print("\n===== FINAL FINANCIAL REPORT =====")
     print(f"Final Cash: ${final_report['cash_balance']:.2f}")
     print(f"Final Inventory: ${final_report['inventory_value']:.2f}")

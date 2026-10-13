@@ -12,7 +12,7 @@ You’ve been hired as an AI consultant by Munder Difflin Paper Company, a ficti
 
 Your solution must use a maximum of **5 agents** and process inputs and outputs entirely via **text-based communication**.
 
-This project challenges your ability to orchestrate agents using modern Python frameworks like `smolagents`, `pydantic-ai`, or `npcsh`, and combine that with real data tools like `sqlite3`, `pandas`, and LLM prompt engineering.
+This project challenges your ability to orchestrate agents using modern Python frameworks like `smolagents`, `pydantic-ai`, or `npcsh`, and combine that with real data tools like `sqlite3` and `pandas`.
 
 ---
 
@@ -24,12 +24,14 @@ From the `project.zip` starter archive, you will find:
 - `quotes.csv`: Historical quote data used for reference by quoting agents
 - `quote_requests.csv`: Incoming customer requests used to build quoting logic
 - `quote_requests_sample.csv`: A set of simulated test cases to evaluate your system
+- `Agent_workflow.png` and `Agent_workflow.mmd`: Rendered workflow and its editable Mermaid source
+- `design_notes.txt`: Architecture, design reflection, and full-sample evaluation
 
 ---
 
 ## Workspace Instructions
 
-All the files have been provided in the VS Code workspace on the Udacity platform. Please install the agent orchestration framework of your choice.
+The completed implementation selects `smolagents` and uses framework `ToolCallingAgent` instances with managed-agent delegation. Install dependencies from the project requirements file.
 
 ## Local setup instructions
 
@@ -41,27 +43,12 @@ You can install all required packages using the provided requirements.txt file:
 
 `pip install -r requirements.txt`
 
-If you're using smolagents, install it separately:
-
-`pip install smolagents`
-
-For other options like pydantic-ai or npcsh[lite], refer to their documentation.
-
-2. Create .env File
-
-Add your OpenAI-compatible API key:
-
-`UDACITY_OPENAI_API_KEY=your_openai_key_here`
-
-This project uses a custom OpenAI-compatible proxy hosted at https://openai.vocareum.com/v1.
-
 ## How to Run the Project
 
-Start by defining your agents in the `"YOUR MULTI AGENT STARTS HERE"` section inside `template.py`. Once your agent team is ready:
-
-1. Run the `run_test_scenarios()` function at the bottom of the script.
-2. This will simulate a series of customer requests.
-3. Your system should respond by coordinating inventory checks, generating quotes, and processing orders.
+Run `python project_starter.py` from the project directory. The full sample
+evaluation runs through the smolagents manager and specialist agents. The
+local deterministic model adapter does not require an API key or external
+model service.
 
 Output will include:
 
@@ -69,6 +56,10 @@ Output will include:
 - Cash and inventory updates
 - Final financial report
 - A `test_results.csv` file with all interaction logs
+- An internal-only `business_advisor_report.txt`
+
+Run the focused framework delegation test with
+`python -m unittest test_framework_workflow -v` from this directory.
 
 ---
 
